@@ -1,0 +1,12 @@
+# Never commit real secrets
+secrets.toml
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local vector DB (if you switch back to persistent Chroma)
+chroma_research_db/

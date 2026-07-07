@@ -88,8 +88,9 @@ except ImportError:
 
 # ------- Config --------
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-CHUNK_SIZE      = 1000
+CHUNK_SIZE      = 1500   # larger chunks → fewer embeddings → lower peak memory on Streamlit Cloud
 CHUNK_OVERLAP   = 150
+EMBED_BATCH     = 32     # add chunks to Chroma in small batches to avoid a memory spike (OOM) on the 1 GB tier
 TOP_K           = 10
 MEMORY_WINDOW   = 3
 
@@ -430,7 +431,14 @@ def process_documents(file_signatures: tuple, _uploaded_files: list):
     )
     splits = splitter.split_documents(all_docs)
     embeddings = FastEmbedEmbeddings(model_name=EMBEDDING_MODEL)   # ONNX, no torch
-    vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+
+    # Embed + insert in small batches instead of one giant Chroma.from_documents call.
+    # On Streamlit Community Cloud (~1 GB RAM) embedding every chunk of a large paper
+    # at once spikes memory past the limit and the container is OOM-killed (the app
+    # "crashes" mid-indexing). Batching keeps peak memory flat regardless of doc size.
+    vectorstore = Chroma(embedding_function=embeddings)
+    for i in range(0, len(splits), EMBED_BATCH):
+        vectorstore.add_documents(splits[i:i + EMBED_BATCH])
     return vectorstore, texts, errors
 
 

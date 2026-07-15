@@ -88,7 +88,7 @@ except ImportError:
 
 # ------- Config --------
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-CHUNK_SIZE      = 1500   # larger chunks → fewer embeddings → lower peak memory on Streamlit Cloud
+CHUNK_SIZE      = 2000   # larger chunks → fewer embeddings → lower peak memory on Streamlit Cloud
 CHUNK_OVERLAP   = 150
 EMBED_BATCH     = 32     # add chunks to Chroma in small batches to avoid a memory spike (OOM) on the 1 GB tier
 TOP_K           = 10

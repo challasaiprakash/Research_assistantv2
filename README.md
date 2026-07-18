@@ -222,7 +222,7 @@ All tuneable parameters are at the top of `Researchassistant.py`:
 | Variable | Default | Description |
 |---|---|---|
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | FastEmbed ONNX model (swap to `bge-large` for higher quality) |
-| `CHUNK_SIZE` | `1000` | Token size per chunk |
+| `CHUNK_SIZE` | `1500` | Token size per chunk |
 | `CHUNK_OVERLAP` | `150` | Overlap between consecutive chunks |
 | `TOP_K` | `10` | Number of chunks retrieved per query |
 | `MEMORY_WINDOW` | `3` | Number of prior Q&A pairs included in each prompt |

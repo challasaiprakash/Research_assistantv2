@@ -17,7 +17,7 @@ A Streamlit-powered RAG (Retrieval-Augmented Generation) application that lets y
 ---
 ## 🚀 Live Demo
 
-👉 **[click here](https://researcher-assistant-5kk9nap5iucuhfuapp6jbgg.streamlit.app/)**
+👉 **[click here](https://researchassistantv2-79aaycvac74meqppdjn92e.streamlit.app/)**
 
 ---
 ## ✨ Features

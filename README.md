@@ -1,4 +1,4 @@
-[# 🔬 Multi-Document Research Assistant 
+ 🔬 Multi-Document Research Assistant 
 personal Researcher Assistant chatbot
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square)

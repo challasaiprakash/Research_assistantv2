@@ -113,6 +113,63 @@ MODEL_QUEUE = [
 AUTO_LABEL = "Auto (smart fallback)"
 
 
+#  Session-scoped, content-based caching
+#
+#  WHY THIS EXISTS (bug fix):
+#  The previous version used @st.cache_resource on process_documents(),
+#  extract_titles_fast() and build_graph(), keyed on (filename, filesize).
+#  Two problems fell out of that:
+#
+#   1. st.cache_resource is a *process-wide* cache shared by every user and
+#      every browser session hitting this app — it is NOT reset when you
+#      clear the file uploader or start a "new" session. If a newly
+#      uploaded file happened to share a name+size with an earlier one
+#      (e.g. re-uploading a same-named test PDF, or — worse, on a shared
+#      deployment — two different users' files colliding), Streamlit
+#      treated it as a cache *hit* and hy handed back the OLD vectorstore
+#      without ever reading the new file's bytes.
+#   2. build_graph()'s cache key was only (doc_names, doc_titles) — the
+#      vectorstore/doc_texts args were prefixed with "_" specifically so
+#      Streamlit would NOT hash them. So even when process_documents() DID
+#      re-index correctly, build_graph() could still return an old graph
+#      object that had the previous vectorstore baked into its closures,
+#      as long as the filenames matched a prior run.
+#
+#  Fix: key everything off a hash of the actual file bytes (so different
+#  content is always detected, no matter the name/size), and store the
+#  cache in st.session_state instead of a global st.cache_resource — so
+#  each browser session gets its own data, and clearing/replacing a file
+#  always invalidates the old vectorstore/graph for THAT user only.
+def _content_signature(sources) -> tuple:
+    """(name, sha256-of-bytes, size) per source — changes whenever content changes."""
+    import hashlib
+    sig = []
+    for f in sources:
+        data = f.getvalue()
+        sig.append((f.name, hashlib.sha256(data).hexdigest(), len(data)))
+    return tuple(sig)
+
+
+def _get_cached(cache_key: str, signature, compute_fn, spinner_text: str | None = None):
+    """Recompute compute_fn() only when `signature` differs from what's stored.
+
+    Lives in st.session_state (per-user), not a global st.cache_resource, and
+    only ever keeps the latest entry per cache_key — so swapping documents
+    can't leave stale vectorstores/graphs reachable, and old ones are freed.
+    """
+    store = st.session_state.setdefault("_pipeline_cache", {})
+    entry = store.get(cache_key)
+    if entry is not None and entry[0] == signature:
+        return entry[1]
+    if spinner_text:
+        with st.spinner(spinner_text):
+            result = compute_fn()
+    else:
+        result = compute_fn()
+    store[cache_key] = (signature, result)
+    return result
+
+
 #  Step 1: Load any file type
 def load_file(file_path: str, filename: str) -> list[Document]:
     ext = Path(filename).suffix.lower()
@@ -347,8 +404,7 @@ def fetch_url_article(url: str) -> URLSource:
 
 
 #   FAST title pass reads ONLY the first page of each PDF
-@st.cache_resource(show_spinner="🔖 Reading titles...")
-def extract_titles_fast(file_signatures: tuple, _uploaded_files: list) -> list:
+def _extract_titles_fast_impl(uploaded_files: list) -> list:
     """
     Title only — opens each PDF and reads JUST the first page (where the title is),
     so titles appear immediately, before the heavy full-document indexing runs.
@@ -356,7 +412,7 @@ def extract_titles_fast(file_signatures: tuple, _uploaded_files: list) -> list:
     """
     tmp_dir = tempfile.gettempdir()
     titles = []
-    for uf in _uploaded_files:
+    for uf in uploaded_files:
 
         pre_title = getattr(uf, "title", None)
         if pre_title:
@@ -384,13 +440,12 @@ def extract_titles_fast(file_signatures: tuple, _uploaded_files: list) -> list:
 
 
 
-@st.cache_resource(show_spinner="📚 Indexing documents…")
-def process_documents(file_signatures: tuple, _uploaded_files: list):
+def _process_documents_impl(uploaded_files: list):
     """Parse every page once → (vectorstore for RAG, {filename: full_text})."""
     tmp_dir = tempfile.gettempdir()
     all_docs, texts, errors = [], {}, []
 
-    for uf in _uploaded_files:
+    for uf in uploaded_files:
         name = uf.name
         ext = Path(name).suffix.lower()
         path = os.path.join(tmp_dir, name)
@@ -748,9 +803,8 @@ class GraphState(TypedDict):
     llm_messages: list
 
 
-@st.cache_resource(show_spinner=False)
-def build_graph(doc_names: tuple, doc_titles: tuple, _vectorstore, _doc_texts: dict):
-    """Compile the classify → retrieve → generate graph (cached per upload set)."""
+def _build_graph_impl(doc_names: tuple, doc_titles: tuple, vectorstore, doc_texts: dict):
+    """Compile the classify → retrieve → generate graph for the current upload set."""
     # Map each filename to its article number (1-based, in upload order) and title.
     name_to_num = {name: i + 1 for i, name in enumerate(doc_names)}
     name_to_title = {name: doc_titles[i] for i, name in enumerate(doc_names)}
@@ -763,7 +817,7 @@ def build_graph(doc_names: tuple, doc_titles: tuple, _vectorstore, _doc_texts: d
     def retrieve_node(state: GraphState) -> GraphState:
         # Only reached for non-reference_count questions (see route_after_classify).
         context, sources, raw_chunks = retrieve_and_format(
-            _vectorstore, state["question"], name_to_num, name_to_title)
+            vectorstore, state["question"], name_to_num, name_to_title)
         state["context"], state["sources"], state["raw_chunks"] = context, sources, raw_chunks
         return state
 
@@ -786,7 +840,7 @@ def build_graph(doc_names: tuple, doc_titles: tuple, _vectorstore, _doc_texts: d
         if state["q_type"] == "reference_count":
             lines, total = [], 0
             for name in doc_names:
-                n = count_references_in_text(_doc_texts.get(name, ""))
+                n = count_references_in_text(doc_texts.get(name, ""))
                 total += n
                 if single_doc:
                     lines.append(f"This document contains **{n} references**.")
@@ -1319,11 +1373,16 @@ if not all_sources:
     st.info("👈 Upload your research articles **or paste an article URL** from the left to begin.")
     st.stop()
 
-signatures = tuple((f.name, f.size) for f in all_sources)
+signatures = _content_signature(all_sources)
 
 # 1)  read just the first page of each PDF for the title (URL articles already
+#     carry a pre-extracted .title, handled inside _extract_titles_fast_impl)
 
-extracted_titles = extract_titles_fast(signatures, all_sources)
+extracted_titles = _get_cached(
+    "titles", signatures,
+    lambda: _extract_titles_fast_impl(all_sources),
+    spinner_text="🔖 Reading titles...",
+)
 
 
 with st.sidebar.expander("✏️ Edit article titles", expanded=False):
@@ -1349,7 +1408,11 @@ for i, (title, name) in enumerate(zip(article_titles, article_names)):
 
 st.divider()
 
-vectorstore, doc_texts, parse_errors = process_documents(signatures, all_sources)
+vectorstore, doc_texts, parse_errors = _get_cached(
+    "documents", signatures,
+    lambda: _process_documents_impl(all_sources),
+    spinner_text="📚 Indexing documents…",
+)
 if not vectorstore:
     # Friendly, non-alarming guidance instead of a red error box.
     log.warning("No documents indexed for sources: %s", article_names)
@@ -1360,7 +1423,13 @@ if not vectorstore:
             for e in parse_errors:
                 st.code(e)
     st.stop()
-app = build_graph(tuple(article_names), tuple(article_titles), vectorstore, doc_texts)
+# Titles are user-editable and change what gets baked into the prompt/citations,
+# so they're part of the graph's cache key alongside the content signature.
+graph_signature = (signatures, tuple(article_titles))
+app = _get_cached(
+    "graph", graph_signature,
+    lambda: _build_graph_impl(tuple(article_names), tuple(article_titles), vectorstore, doc_texts),
+)
 
 
 pending = None

@@ -171,6 +171,15 @@ def _get_cached(cache_key: str, signature, compute_fn, spinner_text: str | None 
 
 
 #  Step 1: Load any file type
+@st.cache_resource(show_spinner=False)
+def _get_embeddings():
+    """The embedding MODEL itself is stateless and holds no per-user document
+    data, so — unlike the vectorstore — it's safe to share via a global
+    st.cache_resource across sessions. This just avoids reloading the ONNX
+    model from disk every time someone swaps a PDF."""
+    return FastEmbedEmbeddings(model_name=EMBEDDING_MODEL)
+
+
 def load_file(file_path: str, filename: str) -> list[Document]:
     ext = Path(filename).suffix.lower()
 
@@ -440,8 +449,12 @@ def _extract_titles_fast_impl(uploaded_files: list) -> list:
 
 
 
-def _process_documents_impl(uploaded_files: list):
-    """Parse every page once → (vectorstore for RAG, {filename: full_text})."""
+def _process_documents_impl(uploaded_files: list, collection_name: str):
+    """Parse every page once → (vectorstore for RAG, {filename: full_text}).
+
+    collection_name MUST be unique per distinct set of document content (see
+    _get_vectorstore_and_texts below) — see the note above Chroma(...) for why.
+    """
     tmp_dir = tempfile.gettempdir()
     all_docs, texts, errors = [], {}, []
 
@@ -477,16 +490,75 @@ def _process_documents_impl(uploaded_files: list):
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     splits = splitter.split_documents(all_docs)
-    embeddings = FastEmbedEmbeddings(model_name=EMBEDDING_MODEL)   # ONNX, no torch
+    embeddings = _get_embeddings()
 
     # Embed + insert in small batches instead of one giant Chroma.from_documents call.
     # On Streamlit Community Cloud (~1 GB RAM) embedding every chunk of a large paper
     # at once spikes memory past the limit and the container is OOM-killed (the app
     # "crashes" mid-indexing). Batching keeps peak memory flat regardless of doc size.
-    vectorstore = Chroma(embedding_function=embeddings)
+    #
+    # IMPORTANT: collection_name is required and must be unique per document set.
+    # chromadb's default client (created when you call Chroma() with no client/
+    # collection_name) is a process-wide SINGLETON — every Chroma() instance you
+    # construct without one shares the SAME underlying in-memory collection
+    # ("langchain"), for as long as the Streamlit server process stays up. That
+    # meant a "new" vectorstore object was really just a new Python handle onto
+    # the SAME growing collection: old PDFs' chunks never went away, so
+    # similarity search kept surfacing them alongside (or instead of) the new
+    # PDF's content, even after re-indexing correctly. A content-derived,
+    # unique collection_name gives every distinct document set its own
+    # isolated collection so old content can never leak into new answers.
+    vectorstore = Chroma(embedding_function=embeddings, collection_name=collection_name)
     for i in range(0, len(splits), EMBED_BATCH):
         vectorstore.add_documents(splits[i:i + EMBED_BATCH])
     return vectorstore, texts, errors
+
+
+def _get_vectorstore_and_texts(signature, all_sources):
+    """(Re)build the vectorstore only when `signature` changes.
+
+    Also deletes the PREVIOUS signature's Chroma collection before building
+    the new one, so the shared chromadb backend never accumulates orphaned
+    collections from documents that have since been removed/replaced —
+    otherwise they'd sit in memory for the life of the server process.
+    """
+    import hashlib
+    store = st.session_state.setdefault("_pipeline_cache", {})
+    entry = store.get("documents")
+    if entry is not None and entry[0] == signature:
+        return entry[1]   # cache hit: (vectorstore, texts, errors)
+
+    if entry is not None:
+        old_vectorstore = entry[1][0]
+        if old_vectorstore is not None:
+            try:
+                old_vectorstore.delete_collection()
+            except Exception:
+                log.warning("Could not delete previous Chroma collection.")
+
+    collection_name = "docs_" + hashlib.sha256(repr(signature).encode()).hexdigest()[:20]
+    with st.spinner("📚 Indexing documents…"):
+        result = _process_documents_impl(all_sources, collection_name)
+    store["documents"] = (signature, result)
+    return result
+
+
+def _reset_all_state():
+    """Wipe chat history AND every cached document artifact for this session:
+    the pipeline cache (titles/vectorstore/graph) and the underlying Chroma
+    collection itself. Called when the user clicks 'Clear conversation' and
+    whenever every document has been removed — so removing/replacing a PDF
+    can never leave old content reachable in a later answer."""
+    entry = st.session_state.get("_pipeline_cache", {}).get("documents")
+    if entry is not None:
+        old_vectorstore = entry[1][0]
+        if old_vectorstore is not None:
+            try:
+                old_vectorstore.delete_collection()
+            except Exception:
+                log.warning("Could not delete Chroma collection during reset.")
+    st.session_state["_pipeline_cache"] = {}
+    st.session_state.messages = []
 
 
 def count_references_in_text(text: str) -> int:
@@ -1318,7 +1390,10 @@ with st.sidebar:
 
     if uploaded_files or st.session_state.url_sources:
         if st.button("🗑️ Clear conversation", use_container_width=True):
-            st.session_state.messages = []
+            # Wipes chat history AND the cached vectorstore/graph/Chroma
+            # collection — not just the visible messages — so nothing about
+            # the current documents can bleed into what you upload next.
+            _reset_all_state()
             st.rerun()
 
 
@@ -1370,6 +1445,11 @@ article_names = [f.name for f in all_sources]
 st.title("🔬 Research Assistant")
 
 if not all_sources:
+    # Every document has been removed (uploader cleared, no URL sources left).
+    # Purge any leftover vectorstore/graph/Chroma collection now, so the next
+    # upload always starts from a clean slate instead of reusing anything
+    # left behind by the documents that were just removed.
+    _reset_all_state()
     st.info("👈 Upload your research articles **or paste an article URL** from the left to begin.")
     st.stop()
 
@@ -1408,11 +1488,7 @@ for i, (title, name) in enumerate(zip(article_titles, article_names)):
 
 st.divider()
 
-vectorstore, doc_texts, parse_errors = _get_cached(
-    "documents", signatures,
-    lambda: _process_documents_impl(all_sources),
-    spinner_text="📚 Indexing documents…",
-)
+vectorstore, doc_texts, parse_errors = _get_vectorstore_and_texts(signatures, all_sources)
 if not vectorstore:
     # Friendly, non-alarming guidance instead of a red error box.
     log.warning("No documents indexed for sources: %s", article_names)
